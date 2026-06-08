@@ -1,6 +1,9 @@
 //! Device-list construction and selection helpers for [`super::AppState`].
 
+use std::collections::HashSet;
+
 use openlogi_agent_core::device_order::DeviceStableId;
+use openlogi_core::config::{Config, DeviceIdentity};
 use openlogi_core::device::{BatteryInfo, Capabilities, DeviceInventory, DeviceKind};
 use openlogi_hid::{DIRECT_DEVICE_INDEX, DeviceRoute};
 use tracing::debug;
@@ -37,9 +40,21 @@ pub struct DeviceRecord {
     pub battery: Option<BatteryInfo>,
 }
 
+/// Build the carousel's device list as the **union** of the live inventory and
+/// the persisted set of devices we've seen before.
+///
+/// Live devices come from `inventories` (the agent's current HID++ probe).
+/// Every device the user has previously seen online but that is *absent* from
+/// this snapshot — asleep, or not yet re-probed after a cold start — is added
+/// back as an offline placeholder from [`Config::known_identities`]. This is
+/// what makes the list independent of whether a probe wins its timing race: a
+/// known device (with its Pointer/Buttons panels) is always shown, and the live
+/// probe only *enriches* it (online state, battery, asset photo) rather than
+/// *gating* whether it appears at all. See issue #159.
 pub(super) fn build_device_list(
     inventories: &[DeviceInventory],
     cache: &AssetResolver,
+    config: &Config,
 ) -> Vec<DeviceRecord> {
     let mut list = Vec::new();
     for inv in inventories {
@@ -74,8 +89,51 @@ pub(super) fn build_device_list(
     if std::env::var_os("OPENLOGI_DEMO_KEYBOARD").is_some() {
         list.push(demo_keyboard());
     }
+    append_offline_known(&mut list, config.known_identities());
     sort_device_list(&mut list);
     list
+}
+
+/// Append an offline placeholder for every known device not already present in
+/// `list` (matched by `config_key`). Split out from [`build_device_list`] so
+/// the union rule is unit-testable without an [`AssetResolver`].
+fn append_offline_known<'a>(
+    list: &mut Vec<DeviceRecord>,
+    known: impl Iterator<Item = (&'a str, &'a DeviceIdentity)>,
+) {
+    let present: HashSet<&str> = list.iter().map(|r| r.config_key.as_str()).collect();
+    // Collect before extending: `present` borrows `list`, so the phantoms must
+    // be materialized before we can mutate it.
+    let phantoms: Vec<DeviceRecord> = known
+        .filter(|(key, _)| !present.contains(key))
+        .map(|(key, identity)| offline_record(key, identity))
+        .collect();
+    drop(present);
+    list.extend(phantoms);
+}
+
+/// Synthesize an offline placeholder from a persisted [`DeviceIdentity`].
+///
+/// `route: None` keeps every hardware write a no-op until the live inventory
+/// supplies the real route when the device wakes; `capabilities: Some(..)` from
+/// the persisted measurement is what keeps the device's config panels visible
+/// while it sleeps. The asset photo is left to the live record (we don't
+/// re-resolve it here), so an offline card shows the synthetic silhouette until
+/// the device comes back online.
+fn offline_record(config_key: &str, identity: &DeviceIdentity) -> DeviceRecord {
+    DeviceRecord {
+        config_key: config_key.to_string(),
+        display_name: identity.display_name.clone(),
+        asset: None,
+        serial_number: None,
+        unit_id: [0; 4],
+        route: None,
+        kind: identity.kind,
+        capabilities: Some(identity.capabilities),
+        slot: 0,
+        online: false,
+        battery: None,
+    }
 }
 
 /// Order the carousel by physical route. HID enumeration order can change as
@@ -213,7 +271,73 @@ fn prettify_codename(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeviceKind, effective_kind};
+    use super::{
+        Capabilities, DeviceIdentity, DeviceKind, DeviceRecord, append_offline_known,
+        effective_kind, offline_record,
+    };
+
+    fn online_record(key: &str) -> DeviceRecord {
+        DeviceRecord {
+            config_key: key.to_string(),
+            display_name: format!("live {key}"),
+            asset: None,
+            serial_number: None,
+            unit_id: [1; 4],
+            route: None,
+            kind: DeviceKind::Mouse,
+            capabilities: Some(Capabilities::presumed_from_kind(DeviceKind::Mouse)),
+            slot: 1,
+            online: true,
+            battery: None,
+        }
+    }
+
+    fn mouse_identity(name: &str) -> DeviceIdentity {
+        DeviceIdentity {
+            display_name: name.to_string(),
+            kind: DeviceKind::Mouse,
+            capabilities: Capabilities {
+                buttons: true,
+                pointer: true,
+                lighting: false,
+            },
+        }
+    }
+
+    #[test]
+    fn offline_record_is_present_but_inert() {
+        // A persisted identity renders as an offline card that still carries its
+        // measured capabilities (so its panels show) but no route (so writes are
+        // no-ops until it wakes).
+        let id = mouse_identity("MX Master 3S");
+        let rec = offline_record("2b034", &id);
+        assert_eq!(rec.config_key, "2b034");
+        assert_eq!(rec.display_name, "MX Master 3S");
+        assert!(!rec.online);
+        assert!(rec.route.is_none());
+        assert_eq!(rec.capabilities, Some(id.capabilities));
+    }
+
+    #[test]
+    fn known_devices_are_appended_only_when_absent_from_live() {
+        // "A" is live; "B" is known-but-asleep. The union keeps the live "A"
+        // untouched and adds "B" back as an offline placeholder — the core of
+        // the #159 fix: a sleeping device never drops out of the list.
+        let mut list = vec![online_record("A")];
+        let a = mouse_identity("live A overwritten?");
+        let b = mouse_identity("asleep B");
+        append_offline_known(&mut list, [("A", &a), ("B", &b)].into_iter());
+
+        assert_eq!(list.len(), 2);
+        assert!(
+            list.iter().any(|r| r.config_key == "A" && r.online),
+            "the live record for A must win over its identity"
+        );
+        assert!(
+            list.iter().any(|r| r.config_key == "B" && !r.online),
+            "B is added back as a persisted offline placeholder"
+        );
+    }
 
     #[test]
     fn asset_kind_overrides_a_misreporting_hid_kind() {
